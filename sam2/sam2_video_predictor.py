@@ -42,6 +42,7 @@ class SAM2VideoPredictor(SAM2Base):
     def init_state(
         self,
         video_path,
+        target_fps = None,
         offload_video_to_cpu=False,
         offload_state_to_cpu=False,
         async_loading_frames=False,
@@ -54,6 +55,7 @@ class SAM2VideoPredictor(SAM2Base):
             offload_video_to_cpu=offload_video_to_cpu,
             async_loading_frames=async_loading_frames,
             compute_device=compute_device,
+            target_fps = target_fps,
         )
         inference_state = {}
         inference_state["images"] = images

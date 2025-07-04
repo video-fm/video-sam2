@@ -177,6 +177,7 @@ def load_video_frames(
     img_std=(0.229, 0.224, 0.225),
     async_loading_frames=False,
     compute_device=torch.device("cuda"),
+    target_fps = None
 ):
     """
     Load the video frames from video_path. The frames are resized to image_size as in
@@ -193,8 +194,10 @@ def load_video_frames(
             img_mean=img_mean,
             img_std=img_std,
             compute_device=compute_device,
+            target_fps = target_fps
         )
     elif is_str and os.path.isdir(video_path):
+        assert target_fps is None, "Only support changing FPS in video path loading"
         return load_video_frames_from_jpg_images(
             video_path=video_path,
             image_size=image_size,
@@ -284,10 +287,11 @@ def load_video_frames_from_video_file(
     img_mean=(0.485, 0.456, 0.406),
     img_std=(0.229, 0.224, 0.225),
     compute_device=torch.device("cuda"),
+    target_fps = None
 ):
     """Load the video frames from a video file."""
     import decord
-
+    
     img_mean = torch.tensor(img_mean, dtype=torch.float32)[:, None, None]
     img_std = torch.tensor(img_std, dtype=torch.float32)[:, None, None]
     # Get the original video height and width
@@ -295,14 +299,33 @@ def load_video_frames_from_video_file(
     video_height, video_width, _ = decord.VideoReader(video_path).next().shape
     # Iterate over all frames in the video
     images = []
-    for frame in decord.VideoReader(video_path, width=image_size, height=image_size):
+    
+    decord_vr = decord.VideoReader(video_path, width=image_size, height=image_size, num_threads=1)
+    for frame in decord_vr:
         images.append(frame.permute(2, 0, 1))
-
-    images = torch.stack(images, dim=0).float() / 255.0
+    
+    if not target_fps is None:
+        
+        new_images = []
+        fps_vid = decord_vr.get_avg_fps()
+        assert target_fps <= fps_vid, "Target FPS should be less than or equal to the video's FPS."
+        
+        # Calculate the sampling rate
+        sample_rate = int(fps_vid / target_fps)
+        
+        # Resample the frames by selecting every 'sample_rate' frame
+        for i in range(0, len(images), sample_rate):
+            new_images.append(images[i])  # Assuming you want the frames as numpy arrays
+        
+        images = new_images
+    
+    raw_images = torch.stack(images, dim=0)
+    images = raw_images.float() / 255.0
     if not offload_video_to_cpu:
         images = images.to(compute_device)
         img_mean = img_mean.to(compute_device)
         img_std = img_std.to(compute_device)
+        
     # normalize by mean and std
     images -= img_mean
     images /= img_std

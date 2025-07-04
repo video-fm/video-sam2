@@ -5,11 +5,15 @@
 # LICENSE file in the root directory of this source tree.
 
 # Adapted from https://github.com/facebookresearch/segment-anything/blob/main/segment_anything/automatic_mask_generator.py
+
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 from torchvision.ops.boxes import batched_nms, box_area  # type: ignore
+import matplotlib.pyplot as plt
+from PIL import Image
+import os 
 
 from sam2.modeling.sam2_base import SAM2Base
 from sam2.sam2_image_predictor import SAM2ImagePredictor
@@ -32,6 +36,83 @@ from sam2.utils.amg import (
     uncrop_points,
 )
 
+
+def show_mask(mask, ax, obj_id=None, random_color=False):
+    if random_color:
+        color = np.concatenate([np.random.random(3), np.array([0.8])], axis=0)
+    else:
+        cmap = plt.get_cmap("gist_rainbow")
+        cmap_idx = 0 if obj_id is None else obj_id
+        color = list(cmap((cmap_idx * 47) % 256))
+        color[3] = 0.8
+        color = np.array(color)
+        
+    h, w = mask.shape[-2:]
+    mask_image = mask.reshape(h, w, 1) * color.reshape(1, 1, -1)
+    ax.imshow(mask_image)
+    
+def show_points(coords, labels, ax, marker_size=375):
+    pos_points = coords[labels==1]
+    neg_points = coords[labels==0]
+    ax.scatter(pos_points[:, 0], pos_points[:, 1], color='green', marker='*', s=marker_size, edgecolor='white', linewidth=1.25)
+    ax.scatter(neg_points[:, 0], neg_points[:, 1], color='red', marker='*', s=marker_size, edgecolor='white', linewidth=1.25)   
+    
+def show_box(box, ax):
+    x0, y0 = box[0], box[1]
+    w, h = box[2] - box[0], box[3] - box[1]
+    ax.add_patch(plt.Rectangle((x0, y0), w, h, edgecolor='green', facecolor=(0,0,0,0), lw=2))
+    
+def save_prompts_one_image(frame_image, boxes, points, labels, save_path):
+    # Create a figure and axis
+    fig, ax = plt.subplots(1, figsize=(6, 6))
+
+    # Display the frame image
+    ax.imshow(frame_image)
+    ax.axis('off')
+
+    # Add the bounding boxes
+    for box in boxes:
+        show_box(box.cpu(), ax)
+        
+    if not len(points) == 0:
+        show_points(points.cpu(), labels.cpu(), ax)
+        
+    # Show the plot
+    plt.savefig(save_path)
+    plt.close()
+    
+def save_video_prompts_visualization(video_tensor, video_boxes, video_points, video_labels, video_id, video_save_base_dir):
+    video_save_dir = os.path.join(video_save_base_dir, video_id)
+    if not os.path.exists(video_save_dir):
+        os.mkdir(video_save_dir)
+        
+    for frame_id, image in enumerate(video_tensor):
+        boxes, points, labels = [], [], []
+        
+        if frame_id in video_boxes:
+            boxes = video_boxes[frame_id]
+            points = video_points[frame_id]
+            labels = video_labels[frame_id]
+        
+        save_path = os.path.join(video_save_dir, f"{frame_id}.jpg")
+        save_prompts_one_image(image, boxes, points, labels, save_path)
+    
+    
+def save_mask_one_image(frame_image, masks, save_path):
+    # Create a figure and axis
+    fig, ax = plt.subplots(1, figsize=(6, 6))
+
+    # Display the frame image
+    ax.imshow(frame_image)
+    ax.axis('off')
+
+    # Add the bounding boxes
+    for obj_id, mask in masks.items():
+        show_mask(mask, ax, obj_id, random_color=False)
+        
+    # Show the plot
+    plt.savefig(save_path)
+    plt.close()
 
 class SAM2AutomaticMaskGenerator:
     def __init__(
@@ -167,7 +248,13 @@ class SAM2AutomaticMaskGenerator:
         return cls(sam_model, **kwargs)
 
     @torch.no_grad()
-    def generate(self, image: np.ndarray) -> List[Dict[str, Any]]:
+    def generate(self, 
+                 image: np.ndarray,
+                 point_prompts :  Optional[np.ndarray]=None, 
+                 point_labels:  Optional[np.ndarray]=None,
+                 bboxes_prompts :  Optional[np.ndarray]=None,
+                 mask_prompts:  Optional[np.ndarray]=None,
+                 prompt_only: bool=False) -> List[Dict[str, Any]]:
         """
         Generates masks for the given image.
 
@@ -193,7 +280,7 @@ class SAM2AutomaticMaskGenerator:
         """
 
         # Generate masks
-        mask_data = self._generate_masks(image)
+        mask_data = self._generate_masks(image, point_prompts, point_labels, bboxes_prompts, mask_prompts, prompt_only)
 
         # Encode masks
         if self.output_mode == "coco_rle":
@@ -221,7 +308,14 @@ class SAM2AutomaticMaskGenerator:
 
         return curr_anns
 
-    def _generate_masks(self, image: np.ndarray) -> MaskData:
+    def _generate_masks(self, 
+                        image: np.ndarray,
+                        point_prompts :  Optional[np.ndarray]=None, 
+                        point_labels:  Optional[np.ndarray]=None,
+                        bboxes_prompts :  Optional[np.ndarray]=None,
+                        mask_prompts:  Optional[np.ndarray]=None,
+                        prompt_only : bool=False) -> MaskData:
+        
         orig_size = image.shape[:2]
         crop_boxes, layer_idxs = generate_crop_boxes(
             orig_size, self.crop_n_layers, self.crop_overlap_ratio
@@ -229,14 +323,57 @@ class SAM2AutomaticMaskGenerator:
 
         # Iterate over image crops
         data = MaskData()
-        for crop_box, layer_idx in zip(crop_boxes, layer_idxs):
-            crop_data = self._process_crop(image, crop_box, layer_idx, orig_size)
-            data.cat(crop_data)
+        orig_crop_box = crop_boxes[0]
+        
+        smallest_crop_box_area = sorted([(crop_box_area, box_id) for box_id, crop_box_area in enumerate(box_area(torch.tensor(crop_boxes)))])[0][0]
+        
+        if not prompt_only:
+            for crop_box, layer_idx in zip(crop_boxes, layer_idxs):
+                crop_data = self._process_crop(image, crop_box, layer_idx, orig_size)
+                if not 'is_prompt' in data._stats:
+                    data['is_prompt'] = []
+                data['is_prompt'] += [False] * len(crop_data['boxes'])
+                data.cat(crop_data)
 
+        prompt_object_count = 0
+        no_prompt = False
+        if not point_prompts is None:
+            prompt_object_count = len(point_prompts)
+        elif not bboxes_prompts is None:
+            prompt_object_count = len(bboxes_prompts)
+        elif not mask_prompts is None: 
+            prompt_object_count = len(mask_prompts)
+        else:
+            no_prompt = True
+            
+        if point_prompts is None:
+            point_prompts = [None] * prompt_object_count
+            point_labels = [None] * prompt_object_count
+        if bboxes_prompts is None:
+            bboxes_prompts = [None] * prompt_object_count
+        if mask_prompts is None:
+            mask_prompts = [None] * prompt_object_count
+            
+        if not no_prompt:
+            # deal with multiple objects
+            for current_point_prompts, current_point_labels, current_bboxes_prompts, current_mask_prompts in zip(point_prompts, point_labels, bboxes_prompts, mask_prompts):
+                prompt_data = self._process_prompt(image, orig_crop_box, current_point_prompts, current_point_labels, current_bboxes_prompts, current_mask_prompts) 
+                if not 'is_prompt' in data._stats:
+                    data['is_prompt'] = []
+                data['is_prompt'] += [True] * len(prompt_data['boxes'])
+                data.cat(prompt_data)
+            
         # Remove duplicate masks between crops
         if len(crop_boxes) > 1:
             # Prefer masks from smaller crops
-            scores = 1 / box_area(data["crop_boxes"])
+            if len(data["crop_boxes"]) == 0:
+                scores = 1 / torch.tensor([], device=data["crop_boxes"].device)
+            else: 
+                if data['is_prompt'][0]:
+                    scores = torch.stack([1 / smallest_crop_box_area] * len(data['is_prompt']))
+                else:
+                    scores = 1 / box_area(data["crop_boxes"])
+                    
             scores = scores.to(data["boxes"].device)
             keep_by_nms = batched_nms(
                 data["boxes"].float(),
@@ -245,6 +382,7 @@ class SAM2AutomaticMaskGenerator:
                 iou_threshold=self.crop_nms_thresh,
             )
             data.filter(keep_by_nms)
+            
         data.to_numpy()
         return data
 
@@ -289,6 +427,101 @@ class SAM2AutomaticMaskGenerator:
         data["points"] = uncrop_points(data["points"], crop_box)
         data["crop_boxes"] = torch.tensor([crop_box for _ in range(len(data["rles"]))])
 
+        return data
+
+    def _process_prompt(
+        self,
+        image: np.ndarray,
+        smallest_crop_box: np.ndarray,
+        point_prompts :  Optional[np.ndarray]=None, 
+        point_labels:  Optional[np.ndarray]=None,
+        bboxes_prompts :  Optional[np.ndarray]=None,
+        mask_prompts:  Optional[np.ndarray]=None,
+        normalize=True,
+    ) -> MaskData:
+        
+        orig_size = image.shape[:2]
+        orig_h, orig_w = orig_size
+        
+        # Crop the image and calculate embeddings
+        self.predictor.set_image(image)
+
+        # Generate masks for this crop in batches
+        data = MaskData()
+        if point_prompts is None and point_labels is None and bboxes_prompts is None and mask_prompts is None:
+            return data
+        
+        # masks, iou_preds, low_res_masks = self.predictor._predict(
+        #         point_coords=point_prompts[:, None, :],
+        #         point_labels=point_labels[:, None],
+        #         boxes=bboxes_prompts,
+        #         multimask_output=self.multimask_output,
+        #         return_logits=True,
+        #     )
+        
+        if point_prompts is None:
+            input_points = None
+            input_labels = None 
+        else:
+            input_points = point_prompts[None, :, :]
+            input_labels = point_labels[None, :]
+        mask_input, unnorm_coords, labels, unnorm_box = self.predictor._prep_prompts(
+            input_points, input_labels, bboxes_prompts, mask_prompts, normalize_coords=True
+        )
+                
+        masks, iou_preds, low_res_masks = self.predictor._predict(
+                unnorm_coords,
+                labels,
+                unnorm_box,
+                mask_input,
+                multimask_output=self.multimask_output,
+                return_logits=True,
+            )
+
+        # save_mask_one_image(image, {i:mask[0].cpu().numpy() for i, mask in enumerate(masks)}, "/home/jianih/research/LASER/data/LLaVA-Video-178K-v2/outputs/ytb_video_masks_prompt_only/example.jpg", )
+        # Serialize predictions and store in MaskData
+        if point_prompts is None:
+            data_points = torch.tensor([[-1, -1]], device=masks.device).repeat_interleave(masks.shape[1], dim=0)
+        else:
+            data_points = point_prompts.repeat_interleave(masks.shape[1], dim=0)
+            
+        data = MaskData(
+            masks=masks.flatten(0, 1),
+            iou_preds=iou_preds.flatten(0, 1),
+            points=data_points,
+            low_res_masks=low_res_masks.flatten(0, 1),
+        )
+        
+        del masks
+        
+        data["masks"] = data["masks"] > self.mask_threshold        
+        
+        # Filter boxes that touch crop boundaries
+        # crop_box = [0, 0, orig_w, orig_h]
+        
+        # Compress to RLE
+        
+        # data["masks"] = uncrop_masks(data["masks"], crop_box, orig_h, orig_w)
+        data["rles"] = mask_to_rle_pytorch(data["masks"])
+        
+        # For priority purpose
+        data["crop_boxes"] = torch.tensor([smallest_crop_box for _ in range(len(data["rles"]))])
+        
+        # Calculate and filter by stability score
+        data["stability_score"] = torch.tensor([1.0 for _ in range(len(data["rles"]))], device=data["masks"].device)
+        
+        # Return to the original image frame
+        # data["boxes"] = uncrop_boxes_xyxy(data["boxes"], crop_box)
+        # data["crop_boxes"] = torch.tensor([crop_box for _ in range(len(data["rles"]))])
+        self.predictor.reset_predictor()
+        
+        
+        data["boxes"] = batched_mask_to_box(data["masks"])
+
+        # Compress to RLE
+        data["rles"] = mask_to_rle_pytorch(data["masks"])
+        del data["masks"]
+        
         return data
 
     def _process_batch(
