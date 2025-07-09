@@ -663,6 +663,8 @@ class SAM2Base(torch.nn.Module):
         # Step 2: Concatenate the memories and forward through the transformer encoder
         memory = torch.cat(to_cat_memory, dim=0)
         memory_pos_embed = torch.cat(to_cat_memory_pos_embed, dim=0)
+        if memory.dtype != memory_pos_embed.dtype:
+            memory = memory.to(dtype=memory_pos_embed.dtype)
 
         pix_feat_with_mem = self.memory_attention(
             curr=current_vision_feats,
