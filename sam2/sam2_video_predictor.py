@@ -41,22 +41,64 @@ class SAM2VideoPredictor(SAM2Base):
     @torch.inference_mode()
     def init_state(
         self,
-        video_path,
+        video_path=None,
+        images=None,
+        video_height=None,
+        video_width=None,
         target_fps = None,
         offload_video_to_cpu=False,
         offload_state_to_cpu=False,
         async_loading_frames=False,
+        img_mean=(0.485, 0.456, 0.406),
+        img_std=(0.229, 0.224, 0.225),
     ):
-        """Initialize an inference state."""
+        """
+        Initialize an inference state.
+        
+        Args:
+            video_path: Path to video file or directory of images. If None, `images` must be provided.
+            images: Optional torch.Tensor or np.ndarray of shape (num_frames, 3, H, W) or (num_frames, H, W, 3)
+                   with pixel values in range [0, 1] or [0, 255]. Values will be automatically normalized 
+                   if in [0, 255] range. Images will be resized to `image_size`. If numpy array with shape 
+                   (num_frames, H, W, 3), it will be automatically converted to (num_frames, 3, H, W) format.
+                   If provided, `video_path` will be ignored.
+            video_height: Original video height (required if `images` is provided). Used for output resizing.
+            video_width: Original video width (required if `images` is provided). Used for output resizing.
+            target_fps: Target FPS for video loading (only used with `video_path`).
+            offload_video_to_cpu: Whether to offload video frames to CPU memory.
+            offload_state_to_cpu: Whether to offload inference state to CPU memory.
+            async_loading_frames: Whether to load frames asynchronously (only used with `video_path`).
+            img_mean: Mean values for image normalization (default: ImageNet mean).
+            img_std: Std values for image normalization (default: ImageNet std).
+        """
         compute_device = self.device  # device of the model
-        images, video_height, video_width = load_video_frames(
-            video_path=video_path,
-            image_size=self.image_size,
-            offload_video_to_cpu=offload_video_to_cpu,
-            async_loading_frames=async_loading_frames,
-            compute_device=compute_device,
-            target_fps = target_fps,
-        )
+        
+        if images is not None:
+            # Direct tensor input
+            if video_height is None or video_width is None:
+                raise ValueError("video_height and video_width must be provided when using images tensor")
+            images, video_height, video_width = self._process_images_tensor(
+                images=images,
+                video_height=video_height,
+                video_width=video_width,
+                image_size=self.image_size,
+                offload_video_to_cpu=offload_video_to_cpu,
+                compute_device=compute_device,
+                img_mean=img_mean,
+                img_std=img_std,
+            )
+        elif video_path is not None:
+            # Load from file path
+            images, video_height, video_width = load_video_frames(
+                video_path=video_path,
+                image_size=self.image_size,
+                offload_video_to_cpu=offload_video_to_cpu,
+                async_loading_frames=async_loading_frames,
+                compute_device=compute_device,
+                target_fps = target_fps,
+            )
+        else:
+            raise ValueError("Either video_path or images must be provided")
         inference_state = {}
         inference_state["images"] = images
         inference_state["num_frames"] = len(images)
@@ -99,6 +141,117 @@ class SAM2VideoPredictor(SAM2Base):
         # Warm up the visual backbone and cache the image feature on frame 0
         self._get_image_feature(inference_state, frame_idx=0, batch_size=1)
         return inference_state
+
+    @staticmethod
+    def _process_images_tensor(
+        images,
+        video_height,
+        video_width,
+        image_size,
+        offload_video_to_cpu,
+        compute_device,
+        img_mean=(0.485, 0.456, 0.406),
+        img_std=(0.229, 0.224, 0.225),
+    ):
+        """
+        Process a tensor or numpy array of images for SAM2 video predictor.
+        
+        Args:
+            images: torch.Tensor or np.ndarray of shape (num_frames, 3, H, W) or (num_frames, H, W, 3)
+                   with pixel values in range [0, 1] or [0, 255]. Values will be automatically 
+                   normalized to [0, 1] if max value > 1.0. If numpy array with shape (num_frames, H, W, 3),
+                   it will be converted to (num_frames, 3, H, W) format.
+            video_height: Original video height (used for output resizing, not for processing).
+            video_width: Original video width (used for output resizing, not for processing).
+            image_size: Target image size for resizing (images will be resized to this size).
+            offload_video_to_cpu: Whether to offload video frames to CPU memory.
+            compute_device: Device to compute on (usually GPU).
+            img_mean: Mean values for ImageNet normalization (default: (0.485, 0.456, 0.406)).
+            img_std: Std values for ImageNet normalization (default: (0.229, 0.224, 0.225)).
+            
+        Returns:
+            processed_images: Processed and normalized images tensor of shape (num_frames, 3, image_size, image_size).
+            video_height: Original video height (unchanged, used for output resizing).
+            video_width: Original video width (unchanged, used for output resizing).
+        """
+        import numpy as np
+        
+        # Convert numpy array to torch tensor if needed
+        if isinstance(images, np.ndarray):
+            # Handle different numpy array formats
+            if images.ndim == 4:
+                num_frames, dim1, dim2, dim3 = images.shape
+                # Determine format: channels first (3, H, W) or channels last (H, W, 3)
+                # If first dimension is 3, assume channels first format
+                if dim1 == 3:
+                    # Already in (num_frames, 3, H, W) format, no conversion needed
+                    pass
+                elif dim3 == 3:
+                    # Convert from (num_frames, H, W, 3) to (num_frames, 3, H, W)
+                    images = np.transpose(images, (0, 3, 1, 2))
+                else:
+                    raise ValueError(
+                        f"Unsupported numpy array shape: {images.shape}. "
+                        f"Expected (num_frames, 3, H, W) or (num_frames, H, W, 3). "
+                        f"Got shape with dim1={dim1}, dim3={dim3}"
+                    )
+            else:
+                raise ValueError(
+                    f"numpy array must be 4D, got {images.ndim}D with shape {images.shape}"
+                )
+            images = torch.from_numpy(images).float()
+        elif not isinstance(images, torch.Tensor):
+            raise TypeError(f"images must be a torch.Tensor or np.ndarray, got {type(images)}")
+        
+        # Ensure float32
+        if images.dtype != torch.float32:
+            images = images.float()
+        
+        # Check shape
+        if images.dim() != 4:
+            raise ValueError(f"images must be 4D tensor (num_frames, 3, H, W), got shape {images.shape}")
+        
+        num_frames, num_channels, h, w = images.shape
+        if num_frames == 0:
+            raise ValueError("images tensor must contain at least one frame")
+        if num_channels != 3:
+            raise ValueError(f"images must have 3 channels, got {num_channels}")
+        
+        # Handle value range: if max > 1, assume it's [0, 255] and normalize to [0, 1]
+        if images.numel() > 0 and images.max() > 1.0:
+            images = images / 255.0
+        
+        # Resize images to image_size if needed
+        if h != image_size or w != image_size:
+            images = F.interpolate(
+                images,
+                size=(image_size, image_size),
+                mode="bilinear",
+                align_corners=False,
+                antialias=True,
+            )
+        
+        # Prepare normalization tensors
+        img_mean = torch.tensor(img_mean, dtype=torch.float32)[:, None, None]
+        img_std = torch.tensor(img_std, dtype=torch.float32)[:, None, None]
+        
+        # Move to target device
+        if offload_video_to_cpu:
+            # Move to CPU
+            images = images.cpu()
+            img_mean = img_mean.cpu()
+            img_std = img_std.cpu()
+        else:
+            # Move to compute device (usually GPU)
+            images = images.to(compute_device, non_blocking=True)
+            img_mean = img_mean.to(compute_device)
+            img_std = img_std.to(compute_device)
+        
+        # Normalize by mean and std
+        images = images - img_mean
+        images = images / img_std
+        
+        return images, video_height, video_width
 
     @classmethod
     def from_pretrained(cls, model_id: str, **kwargs) -> "SAM2VideoPredictor":
